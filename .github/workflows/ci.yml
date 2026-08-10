@@ -27,5 +27,9 @@ jobs:
 
       - name: Build application
         run: ./mvnw package
+
+      - name: Check Docker
+        run: docker --version
+
       - name: Build Docker image
         run: docker build -t cicd-demo:1.0 .
