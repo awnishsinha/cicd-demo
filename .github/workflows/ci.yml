@@ -26,4 +26,4 @@ jobs:
         run: ./mvnw clean test
 
       - name: Build application
-        run: ./mvn package
+        run: ./mvnw package
