@@ -27,7 +27,7 @@ jobs:
         run : chmod +x mvnw
 
       - name: Run test and build
-        run: ./mvnw package -DskipTests
+        run: ./mvnw clean package
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
