@@ -71,7 +71,7 @@ jobs:
               if curl --fail http://localhost:9091/actuator/health; then
                 echo "Application is healthy"
                 exit 0
-            fi
+              fi
 
             echo "Waiting for application..."
             sleep 2
