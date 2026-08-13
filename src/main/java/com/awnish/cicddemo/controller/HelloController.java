@@ -8,11 +8,11 @@ public class HelloController {
 
     @GetMapping("/api/hello")
     public String hello(){
-        return "Hello Version-Green from CI/CD";
+        return "Hello Version-Blue from CI/CD";
     }
 
     @GetMapping("/api/welcome")
     public String welcome(){
-        return "Welcome to Version-Green from CI/CD";
+        return "Welcome to Version-Blue from CI/CD";
     }
 }
