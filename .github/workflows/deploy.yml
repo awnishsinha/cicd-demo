@@ -52,6 +52,7 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_SSH_KEY }}
+
           script: |
             IMAGE=${{ secrets.DOCKER_USERNAME }}/cicd-demo:${{ github.sha }}
 
@@ -73,9 +74,9 @@ jobs:
                 exit 0
               fi
 
-            echo "Waiting for application..."
-            sleep 2
+              echo "Waiting for application..."
+              sleep 2
             done
-  
-           echo "Application failed to become healthy"
-           exit 1
+
+            echo "Application failed to become healthy"
+            exit 1
