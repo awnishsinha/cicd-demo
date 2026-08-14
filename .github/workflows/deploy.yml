@@ -88,7 +88,7 @@ jobs:
             fi
             
             echo "================================"
-            echo "Preparing Green"
+            echo "Preparing $TARGET_ENV"
             echo "================================"
             
             
