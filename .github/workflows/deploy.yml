@@ -56,27 +56,110 @@ jobs:
           script: |
             IMAGE=${{ secrets.DOCKER_USERNAME }}/cicd-demo:${{ github.sha }}
 
+            echo "================================"
+            echo "Deploying image: $IMAGE"
+            echo "================================"
+
+            echo "Pulling latest image..."
             docker pull $IMAGE
 
-            docker stop cicd-demo || true
-            docker rm cicd-demo || true
+
+            echo "================================"
+            echo "Preparing Green"
+            echo "================================"
+
+            docker stop cicd-demo-green || true
+            docker rm cicd-demo-green || true
+
+            echo "Starting Green container..."
 
             docker run -d \
-              --name cicd-demo \
-              -p 9091:9091 \
+              --name cicd-demo-green \
+              -p 9092:9091 \
               $IMAGE
 
-            echo "Waiting for application to start..."
+
+            echo "================================"
+            echo "Checking Green health"
+            echo "================================"
+
+            HEALTHY=false
 
             for i in {1..30}; do
-              if curl --fail http://localhost:9091/actuator/health; then
-                echo "Application is healthy"
-                exit 0
+
+              if curl --fail http://localhost:9092/actuator/health; then
+                HEALTHY=true
+                echo "Green is healthy!"
+                break
               fi
 
-              echo "Waiting for application..."
+              echo "Green is not ready. Attempt $i/30"
               sleep 2
+
             done
 
-            echo "Application failed to become healthy"
-            exit 1
+
+            if [ "$HEALTHY" != "true" ]; then
+
+              echo "Green deployment failed!"
+
+              docker logs cicd-demo-green
+
+              docker stop cicd-demo-green || true
+              docker rm cicd-demo-green || true
+
+              exit 1
+
+            fi
+
+
+            echo "================================"
+            echo "Green is healthy"
+            echo "Switching Nginx"
+            echo "================================"
+
+
+            sudo sed -i \
+              's/proxy_pass http:\/\/127.0.0.1:9091;/proxy_pass http:\/\/127.0.0.1:9092;/' \
+              /etc/nginx/sites-available/default
+
+
+            echo "Testing Nginx configuration..."
+
+            sudo nginx -t
+
+            if [ $? -ne 0 ]; then
+
+              echo "Nginx configuration failed!"
+
+              exit 1
+
+            fi
+
+
+            echo "Reloading Nginx..."
+
+            sudo systemctl reload nginx
+
+
+            echo "================================"
+            echo "Verifying production traffic"
+            echo "================================"
+
+
+            if curl --fail http://localhost/actuator/health; then
+
+              echo "Production traffic successfully switched to Green!"
+
+            else
+
+              echo "Production verification failed!"
+
+              exit 1
+
+            fi
+
+
+            echo "================================"
+            echo "Blue-Green deployment successful"
+            echo "================================"
