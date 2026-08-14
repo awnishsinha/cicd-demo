@@ -64,36 +64,63 @@ jobs:
             docker pull $IMAGE
 
 
+            
+            
+            CURRENT_PORT=$(grep -oP 'proxy_pass http://127\.0\.0\.1:\K[0-9]+' \
+              /etc/nginx/sites-available/default)
+            
+            if [ "$CURRENT_PORT" = "9091" ]; then
+
+              ACTIVE_ENV="blue"
+              ACTIVE_PORT=9091
+
+              TARGET_ENV="green"
+              TARGET_PORT=9092
+  
+            else
+
+              ACTIVE_ENV="green"
+              ACTIVE_PORT=9092
+  
+              TARGET_ENV="blue"
+              TARGET_PORT=9091
+  
+            fi
+            
             echo "================================"
             echo "Preparing Green"
             echo "================================"
-
-            docker stop cicd-demo-green || true
-            docker rm cicd-demo-green || true
-
-            echo "Starting Green container..."
-
+            
+            
+            
+            echo "Starting $TARGET_ENV container..."
+            
+            docker stop cicd-demo-$TARGET_ENV || true
+            docker rm cicd-demo-$TARGET_ENV || true
+            
             docker run -d \
-              --name cicd-demo-green \
-              -p 9092:9091 \
+              --name cicd-demo-$TARGET_ENV \
+              -p $TARGET_PORT:9091 \
               $IMAGE
+            
+            
 
 
             echo "================================"
-            echo "Checking Green health"
+            echo "Checking $TARGET_ENV health"
             echo "================================"
 
             HEALTHY=false
 
             for i in {1..30}; do
 
-              if curl --fail http://localhost:9092/actuator/health; then
+              if curl --fail http://localhost:$TARGET_PORT/actuator/health; then
                 HEALTHY=true
-                echo "Green is healthy!"
+                echo "$TARGET_ENV is healthy!"
                 break
               fi
 
-              echo "Green is not ready. Attempt $i/30"
+              echo "$TARGET_ENV is not ready. Attempt $i/30"
               sleep 2
 
             done
@@ -101,22 +128,22 @@ jobs:
 
             if [ "$HEALTHY" != "true" ]; then
 
-              echo "Green deployment failed!"
+              echo "$TARGET_ENV deployment failed!"
 
-              docker logs cicd-demo-green
+              docker logs cicd-demo-$TARGET_ENV
 
-              docker stop cicd-demo-green || true
-              docker rm cicd-demo-green || true
+              docker stop cicd-demo-$TARGET_ENV || true
+              docker rm cicd-demo-$TARGET_ENV || true
 
               exit 1
 
             fi
             
             echo "================================"
-            echo "Running Green smoke tests"
+            echo "Running $TARGET_ENV smoke tests"
             echo "================================"
   
-            if curl --fail http://localhost:9092/api/hello; then
+            if curl --fail http://localhost:$TARGET_PORT/api/hello; then
   
               echo "API smoke test passed!"
   
@@ -124,10 +151,10 @@ jobs:
   
               echo "API smoke test FAILED!"
   
-              docker logs cicd-demo-green
+              docker logs cicd-demo-$TARGET_ENV
   
-              docker stop cicd-demo-green || true
-              docker rm cicd-demo-green || true
+              docker stop cicd-demo-$TARGET_ENV || true
+              docker rm cicd-demo-$TARGET_ENV || true
   
               exit 1
   
@@ -135,13 +162,13 @@ jobs:
 
 
             echo "================================"
-            echo "Green is healthy"
+            echo "$TARGET_ENV is healthy"
             echo "Switching Nginx"
             echo "================================"
 
 
             sudo sed -i \
-              's/proxy_pass http:\/\/127.0.0.1:9091;/proxy_pass http:\/\/127.0.0.1:9092;/' \
+              "s/proxy_pass http:\/\/127.0.0.1:$ACTIVE_PORT;/proxy_pass http:\/\/127.0.0.1:$TARGET_PORT;/" \
               /etc/nginx/sites-available/default
 
 
@@ -170,15 +197,15 @@ jobs:
             if curl --fail http://localhost/api/hello; then
 
                 echo "Production verification successful!"
-                echo "Green is now serving production traffic."
+                echo "$TARGET_ENV is now serving production traffic."
 
             else
 
                 echo "Production verification FAILED!"
-                echo "Starting rollback to Blue..."
+                echo "Starting rollback to $ACTIVE_ENV..."
 
                 sudo sed -i \
-                  's/proxy_pass http:\/\/127.0.0.1:9092;/proxy_pass http:\/\/127.0.0.1:9091;/' \
+                  "s/proxy_pass http:\/\/127.0.0.1:$TARGET_PORT;/proxy_pass http:\/\/127.0.0.1:$ACTIVE_PORT;/" \
                   /etc/nginx/sites-available/default
 
                 echo "Testing rollback Nginx configuration..."
@@ -192,10 +219,10 @@ jobs:
 
                 sudo systemctl reload nginx
 
-                echo "Traffic successfully rolled back to Blue."
+                echo "Traffic successfully rolled back to $ACTIVE_ENV."
 
-                docker stop cicd-demo-green || true
-                docker rm cicd-demo-green || true
+                docker stop cicd-demo-$TARGET_ENV || true
+                docker rm cicd-demo-$TARGET_ENV || true
 
                 exit 1
             fi
