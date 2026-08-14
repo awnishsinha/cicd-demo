@@ -111,6 +111,27 @@ jobs:
               exit 1
 
             fi
+            
+            echo "================================"
+            echo "Running Green smoke tests"
+            echo "================================"
+  
+            if curl --fail http://localhost:9092/api/hello; then
+  
+              echo "API smoke test passed!"
+  
+            else
+  
+              echo "API smoke test FAILED!"
+  
+              docker logs cicd-demo-green
+  
+              docker stop cicd-demo-green || true
+              docker rm cicd-demo-green || true
+  
+              exit 1
+  
+            fi
 
 
             echo "================================"
