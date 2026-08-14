@@ -146,20 +146,35 @@ jobs:
             echo "Verifying production traffic"
             echo "================================"
 
+            if curl --fail http://localhost/api/hello; then
 
-            if curl --fail http://localhost/actuator/health; then
-
-              echo "Production traffic successfully switched to Green!"
+                echo "Production verification successful!"
+                echo "Green is now serving production traffic."
 
             else
 
-              echo "Production verification failed!"
+                echo "Production verification FAILED!"
+                echo "Starting rollback to Blue..."
 
-              exit 1
+                sudo sed -i \
+                  's/proxy_pass http:\/\/127.0.0.1:9092;/proxy_pass http:\/\/127.0.0.1:9091;/' \
+                  /etc/nginx/sites-available/default
 
+                echo "Testing rollback Nginx configuration..."
+
+                sudo nginx -t
+
+                if [ $? -ne 0 ]; then
+                    echo "CRITICAL: Rollback Nginx configuration is invalid!"
+                    exit 1
+                fi
+
+                sudo systemctl reload nginx
+
+                echo "Traffic successfully rolled back to Blue."
+
+                docker stop cicd-demo-green || true
+                docker rm cicd-demo-green || true
+
+                exit 1
             fi
-
-
-            echo "================================"
-            echo "Blue-Green deployment successful"
-            echo "================================"
