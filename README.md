@@ -1088,3 +1088,1432 @@ Running Application 🎉
 ---
 
 *This document covers a complete, practical CI/CD implementation — from understanding the concepts to deploying a Spring Boot application automatically on AWS EC2 using GitHub Actions, Docker, and SSH.*
+
+
+# 🚀 CI/CD Advanced Learning — Part 2
+## From Docker SHA Tagging to Dynamic Blue-Green Deployment
+
+> **Building on the fundamentals — this document covers the advanced CI/CD concepts learned through practical implementation: image versioning, health checks, rollback, reverse proxies, and dynamic Blue-Green deployment.**
+
+---
+
+## 📋 Table of Contents
+
+1. [Docker Image Versioning with Git SHA](#docker-image-versioning-with-git-sha)
+2. [Rollback — The Fundamentals](#rollback--the-fundamentals)
+3. [Deployment Health Checks](#deployment-health-checks)
+4. [Spring Boot Actuator](#spring-boot-actuator)
+5. [Health Check Integration in GitHub Actions](#health-check-integration-in-github-actions)
+6. [Reverse Proxy — What It Is and Why](#reverse-proxy--what-it-is-and-why)
+7. [Nginx Installation and Configuration](#nginx-installation-and-configuration)
+8. [Blue-Green Deployment — Manual Practice](#blue-green-deployment--manual-practice)
+9. [Automatic Rollback](#automatic-rollback)
+10. [Dynamic Blue-Green Deployment](#dynamic-blue-green-deployment)
+11. [The Complete Final Workflow](#the-complete-final-workflow)
+12. [Common Bugs and Pitfalls](#common-bugs-and-pitfalls)
+13. [Interview Q&A — Advanced Topics](#interview-qa--advanced-topics)
+14. [Architecture Evolution Summary](#architecture-evolution-summary)
+
+---
+
+## Docker Image Versioning with Git SHA
+
+### The Problem with `:3.0`
+
+Our original pipeline always tagged the Docker image with the same version:
+
+```yaml
+docker build -t username/cicd-demo:3.0 .
+```
+
+Suppose you make three commits:
+
+```
+Commit A → "Fix login bug"
+Commit B → "Add new dashboard"
+Commit C → "Update homepage"
+```
+
+Every push produces:
+
+```
+cicd-demo:3.0
+```
+
+...and overwrites the previous one. After Commit C, Docker Hub shows:
+
+```
+cicd-demo:3.0 → Version C only (A and B are gone)
+```
+
+**Problems this creates:**
+- You cannot tell which Git commit produced the running image
+- Rolling back requires knowing a specific version number you may not have recorded
+- "What was deployed 3 days ago?" becomes unanswerable
+
+### The Solution: Git SHA as Docker Tag
+
+GitHub Actions automatically provides the commit SHA through `github.sha`. For example:
+
+```
+Commit: a81f92c8e7b1...
+```
+
+Change the build step to:
+
+```yaml
+- name: Build Docker image
+  run: |
+    docker build \
+      -t ${{ secrets.DOCKER_USERNAME }}/cicd-demo:${{ github.sha }} \
+      .
+
+- name: Push Docker image
+  run: |
+    docker push \
+      ${{ secrets.DOCKER_USERNAME }}/cicd-demo:${{ github.sha }}
+```
+
+Now Docker Hub contains:
+
+```
+cicd-demo:a81f92c   ← Commit A
+cicd-demo:b72e91d   ← Commit B
+cicd-demo:c99f12a   ← Commit C
+```
+
+Every image is **traceable to an exact Git commit**.
+
+### Update EC2 Deployment to Use SHA
+
+The EC2 deployment script must also use the SHA:
+
+```yaml
+- name: Deploy to EC2
+  uses: appleboy/ssh-action@v1.2.2
+  with:
+    host: ${{ secrets.EC2_HOST }}
+    username: ${{ secrets.EC2_USERNAME }}
+    key: ${{ secrets.EC2_SSH_KEY }}
+    script: |
+      docker pull ${{ secrets.DOCKER_USERNAME }}/cicd-demo:${{ github.sha }}
+
+      docker stop cicd-demo || true
+      docker rm cicd-demo || true
+
+      docker run -d \
+        --name cicd-demo \
+        -p 9091:9091 \
+        ${{ secrets.DOCKER_USERNAME }}/cicd-demo:${{ github.sha }}
+```
+
+### Three Tagging Strategies Compared
+
+| Strategy | Example | Use Case |
+|----------|---------|----------|
+| Version number | `cicd-demo:3.0` | Human-friendly, easy to reference |
+| Git SHA | `cicd-demo:a81f92c` | Precise traceability, reliable rollback |
+| Both | `cicd-demo:3.0` AND `cicd-demo:a81f92c` | Best of both worlds (production ideal) |
+
+> **Why not `latest`?** The `latest` tag is a moving target — it always points to whatever was pushed most recently. In production, you can't answer "what version is running?" if everything is tagged `:latest`.
+
+### The Full Traceability Chain
+
+```
+Developer writes code
+        ↓
+git commit (creates SHA: a81f92c)
+        ↓
+git push triggers GitHub Actions
+        ↓
+Docker image built with tag: cicd-demo:a81f92c
+        ↓
+Image pushed to Docker Hub
+        ↓
+EC2 pulls cicd-demo:a81f92c
+        ↓
+Container runs cicd-demo:a81f92c
+        ↓
+"What's running?" → a81f92c → exact Git commit
+```
+
+---
+
+## Rollback — The Fundamentals
+
+### Deployment Rollback vs. Git Revert
+
+These are two completely different things:
+
+| Concept | What It Does | When to Use |
+|---------|-------------|-------------|
+| **Deployment Rollback** | Changes *which application version is running* on the server | Production has a bug, restore the previous working version immediately |
+| **Git Revert** | Creates a new commit that reverses a previous commit in source history | You want to permanently undo a change through the normal code review process |
+
+Rollback does **not** touch your Git history. It only changes what's deployed.
+
+### Why SHA Tags Make Rollback Reliable
+
+With static tags (`:3.0`), rollback is ambiguous:
+
+```
+# What does "rollback to 3.0" even mean if 3.0 was overwritten?
+docker run cicd-demo:3.0   # Which version is this?
+```
+
+With SHA tags, rollback is precise:
+
+```
+Currently running:  cicd-demo:def456   ← broken
+Previous version:   cicd-demo:abc123   ← known good
+
+Rollback:
+docker pull username/cicd-demo:abc123
+docker stop cicd-demo
+docker rm cicd-demo
+docker run -d --name cicd-demo -p 9091:9091 username/cicd-demo:abc123
+```
+
+### Finding the Previous Image on EC2
+
+```bash
+# See what's currently running and its image
+docker ps
+
+# See all images available locally
+docker images
+
+# Inspect the exact image a container is using
+docker inspect --format='{{.Config.Image}}' cicd-demo
+```
+
+### The Immutable Artifact Principle
+
+A core production CI/CD principle:
+
+> **Once an image is created and tagged with a unique version, that image should always represent exactly that commit — never overwritten.**
+
+```
+cicd-demo:abc123  →  always  →  Git commit abc123
+cicd-demo:def456  →  always  →  Git commit def456
+```
+
+This gives us **traceability**, **reproducibility**, and **reliable rollback**.
+
+---
+
+## Deployment Health Checks
+
+### The Critical Gap in Basic Deployments
+
+Most beginner pipelines stop here:
+
+```bash
+docker run -d --name cicd-demo -p 9091:9091 IMAGE
+# Pipeline says ✅ "Deployment successful"
+```
+
+But `docker run` succeeding only means Docker created the container. It does **not** mean:
+
+```
+Spring Boot started         ✅ ?
+Application is healthy      ✅ ?
+HTTP endpoints work         ✅ ?
+Database connection works   ✅ ?
+```
+
+### What Can Go Wrong After `docker run`
+
+```
+Container starts
+      ↓
+JVM starts
+      ↓
+Spring Boot initializes
+      ↓
+Application tries to connect to database
+      ↓
+❌ Connection refused
+      ↓
+Application crashes
+      ↓
+Container stops (Exited)
+```
+
+To a naive pipeline, the deployment "succeeded." To users, the site is down.
+
+### `docker ps` vs `docker ps -a`
+
+```bash
+# Shows only RUNNING containers
+docker ps
+
+# Shows ALL containers (running + stopped/crashed)
+docker ps -a
+```
+
+If your application crashes after starting, `docker ps` shows nothing, but `docker ps -a` shows:
+
+```
+NAME         STATUS
+cicd-demo    Exited (1) 30 seconds ago
+```
+
+### The Retry Health Check Pattern
+
+Instead of blindly trusting `docker run`, add a retry loop that waits for the application to genuinely respond:
+
+```bash
+docker run -d \
+  --name cicd-demo \
+  -p 9091:9091 \
+  IMAGE
+
+echo "Waiting for application to start..."
+
+for i in {1..30}; do
+  if curl --fail http://localhost:9091/actuator/health; then
+    echo "Application is healthy!"
+    exit 0
+  fi
+
+  echo "Waiting... Attempt $i/30"
+  sleep 2
+done
+
+echo "Application failed to become healthy"
+exit 1
+```
+
+**How the timing works:**
+
+```
+Attempt 1 → curl → fails → sleep 2s
+Attempt 2 → curl → fails → sleep 2s
+...
+Attempt 15 → curl → ✅ SUCCESS → exit 0
+```
+
+The loop gives Spring Boot up to **60 seconds** (30 × 2s) to start. If it responds before then, we stop early. If it never responds, the deployment fails.
+
+### Deployment Success vs. Application Success
+
+| Check | What It Validates | Good Enough? |
+|-------|------------------|-------------|
+| `docker run` exits 0 | Container was created | No |
+| `docker ps` shows "Up" | Container process is running | No |
+| `/actuator/health` returns 200 | Application is actually responding | Yes |
+| Business API returns expected response | Application logic works | Best |
+
+---
+
+## Spring Boot Actuator
+
+### What Is It?
+
+Spring Boot Actuator is a sub-project that adds production-ready monitoring endpoints to your application automatically. The most important one for CI/CD:
+
+```
+GET /actuator/health
+→ {"status":"UP"}
+```
+
+### Adding Actuator to Your Project
+
+In `pom.xml`, inside `<dependencies>`:
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+```
+
+No version needed — Spring Boot's parent POM manages the version automatically.
+
+### Testing the Health Endpoint
+
+After adding the dependency and restarting:
+
+```bash
+# From EC2 or local machine
+curl http://localhost:9091/actuator/health
+```
+
+Response:
+
+```json
+{"status":"UP"}
+```
+
+### Why Use Actuator Instead of a Business Endpoint?
+
+```
+Business endpoint: /api/hello
+→ Returns application data
+→ Depends on business logic
+→ May require authentication
+
+Actuator: /actuator/health
+→ Returns health status only
+→ Designed specifically for health monitoring
+→ Typically public (no auth required)
+→ Used by CI/CD, load balancers, and Kubernetes
+```
+
+The CI/CD pipeline should depend on infrastructure-level health, not business logic. If you check `/api/hello`, a change in your API contract could break your deployment pipeline even if the app is perfectly healthy.
+
+### Two-Level Verification
+
+A mature deployment verifies both:
+
+```
+Level 1 — Infrastructure health:
+  /actuator/health → {"status":"UP"}
+  Confirms: JVM running, Spring Boot started, components OK
+
+Level 2 — Application health:
+  /api/hello → "Hello World"
+  Confirms: Business logic works, routes registered
+```
+
+---
+
+## Health Check Integration in GitHub Actions
+
+### Putting It All Together
+
+Replace the basic EC2 deployment script with one that includes the retry health check:
+
+```yaml
+- name: Deploy to EC2
+  uses: appleboy/ssh-action@v1.2.2
+  with:
+    host: ${{ secrets.EC2_HOST }}
+    username: ${{ secrets.EC2_USERNAME }}
+    key: ${{ secrets.EC2_SSH_KEY }}
+    script: |
+      IMAGE=${{ secrets.DOCKER_USERNAME }}/cicd-demo:${{ github.sha }}
+
+      docker pull $IMAGE
+
+      docker stop cicd-demo || true
+      docker rm cicd-demo || true
+
+      docker run -d \
+        --name cicd-demo \
+        -p 9091:9091 \
+        $IMAGE
+
+      echo "Waiting for application to become healthy..."
+
+      for i in {1..30}; do
+        if curl --fail http://localhost:9091/actuator/health; then
+          echo "Application is healthy!"
+          exit 0
+        fi
+
+        echo "Waiting... Attempt $i/30"
+        sleep 2
+      done
+
+      echo "Application failed to become healthy after 60 seconds"
+      exit 1
+```
+
+### What Changes in GitHub Actions
+
+When the health check fails:
+
+```
+docker run succeeds
+      ↓
+Loop starts
+      ↓
+Attempt 1 → curl → ❌
+Attempt 2 → curl → ❌
+...
+Attempt 30 → curl → ❌
+      ↓
+exit 1
+      ↓
+GitHub Actions step: FAILED ❌
+```
+
+GitHub reports the deployment as failed, not successful. This is the correct behavior — it prevents false positives where your pipeline says "deployed!" while the application is actually down.
+
+---
+
+## Reverse Proxy — What It Is and Why
+
+### The Core Concept
+
+A **proxy** is a middleman. The word "reverse" describes *whose behalf* the proxy is acting on.
+
+#### Forward Proxy — acts on behalf of the CLIENT
+
+```
+Employee
+    ↓
+Company Proxy
+    ↓
+Internet
+
+The proxy represents the CLIENT.
+External servers see the proxy, not the employee.
+```
+
+#### Reverse Proxy — acts on behalf of the SERVER
+
+```
+Internet Users
+      ↓
+Nginx (Reverse Proxy)
+      ↓
+Backend Servers
+
+The proxy represents the SERVERS.
+Users see Nginx, not the internal servers.
+```
+
+The easiest way to remember it:
+
+```
+Forward Proxy:  Client → Proxy → Internet
+                         ↑
+                   represents CLIENT
+
+Reverse Proxy:  Client → Proxy → Server
+                         ↑
+                   represents SERVER
+```
+
+### The Real-World Analogy
+
+Imagine a large company with many departments:
+
+```
+Customer
+    ↓
+Reception Desk   ← The reverse proxy
+    ↓
+Appropriate Department (HR, Finance, Engineering)
+```
+
+The customer doesn't walk directly to employee #382. They talk to reception, which routes them appropriately. Reception:
+- Receives the request
+- Decides where it should go
+- Forwards it
+- Returns the response to the customer
+
+That's exactly what Nginx does.
+
+### Why We Need It for Blue-Green Deployment
+
+Without Nginx, users access our app directly:
+
+```
+User → http://EC2-IP:9091 → Blue v1
+```
+
+With Nginx:
+
+```
+User → http://EC2-IP → Nginx → Blue v1 (or Green v2)
+```
+
+The user's URL never changes. We can silently swap Blue for Green behind Nginx — the user never knows which version they're hitting.
+
+### What Nginx Can Do
+
+| Capability | Description |
+|------------|-------------|
+| **Reverse proxy** | Forward requests to a backend server |
+| **Load balancing** | Distribute requests across multiple servers |
+| **SSL termination** | Handle HTTPS, forward HTTP to backends |
+| **Traffic routing** | Send `/api/*` to one service, `/admin/*` to another |
+| **Blue-Green switching** | Change which backend receives production traffic |
+
+For our project, we primarily use Nginx as a **reverse proxy** for traffic switching, not load balancing.
+
+---
+
+## Nginx Installation and Configuration
+
+### Install Nginx on Ubuntu (EC2)
+
+```bash
+sudo apt update
+sudo apt install nginx -y
+
+# Verify installation
+nginx -v
+
+# Check status
+sudo systemctl status nginx
+
+# Enable auto-start on reboot
+sudo systemctl enable nginx
+```
+
+### Configure Nginx as a Reverse Proxy
+
+Edit the default site configuration:
+
+```bash
+sudo nano /etc/nginx/sites-available/default
+```
+
+Replace the existing `server { }` block with:
+
+```nginx
+server {
+    listen 80;
+    listen [::]:80;
+
+    location / {
+        proxy_pass http://127.0.0.1:9091;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+### Understanding Each Directive
+
+| Directive | Purpose |
+|-----------|---------|
+| `listen 80` | Nginx listens on port 80 (HTTP) |
+| `proxy_pass http://127.0.0.1:9091` | Forward all requests to Blue on port 9091 |
+| `proxy_set_header Host` | Tell backend the original hostname |
+| `proxy_set_header X-Real-IP` | Tell backend the real client IP |
+| `X-Forwarded-For` | Chain of proxy IPs the request passed through |
+| `X-Forwarded-Proto` | Original protocol (http or https) |
+
+### Why `127.0.0.1`?
+
+`127.0.0.1` means "this same machine" (loopback). Nginx and Docker are both running on the same EC2 instance, so Nginx forwards to the local Docker port mapping:
+
+```
+Nginx (EC2)
+    ↓
+127.0.0.1:9091
+    ↓
+Docker port 9091
+    ↓
+Container port 9091
+    ↓
+Spring Boot
+```
+
+### Test and Reload (Always in This Order)
+
+```bash
+# 1. Test the configuration BEFORE reloading — always
+sudo nginx -t
+
+# 2. Only reload if the test passes
+sudo systemctl reload nginx
+```
+
+**Never skip `nginx -t`.** Reloading a broken configuration will leave Nginx in a bad state.
+
+**`reload` vs `restart`:**
+- `reload`: Applies new config while continuing to handle existing connections — minimal disruption
+- `restart`: Completely stops and restarts Nginx — brief interruption to all connections
+
+### AWS Security Group for Nginx
+
+Update your EC2 Security Group to expose port 80:
+
+| Port | Protocol | Source | Purpose |
+|------|----------|--------|---------|
+| 22 | TCP | Admin IPs | SSH access |
+| 80 | TCP | 0.0.0.0/0 | HTTP (Nginx) |
+| 443 | TCP | 0.0.0.0/0 | HTTPS (future) |
+
+Ideally, **remove public access to 9091 and 9092** — those should only be accessible internally through Nginx, not directly from the internet.
+
+### Before and After Nginx
+
+```
+Before Nginx:
+User → http://EC2-IP:9091 → Spring Boot
+
+After Nginx:
+User → http://EC2-IP → Nginx → Spring Boot :9091
+```
+
+The user now accesses your app without specifying a port at all.
+
+---
+
+## Blue-Green Deployment — Manual Practice
+
+### The Core Concept
+
+Instead of:
+
+```
+Stop old version
+      ↓
+Start new version  ← Window where users get errors
+      ↓
+Hope it works
+```
+
+We do:
+
+```
+Old version keeps running (Blue)
+      ↓
+Start new version separately (Green)
+      ↓
+Test Green thoroughly
+      ↓
+Switch Nginx: Blue → Green (instant, no downtime)
+      ↓
+If Green fails → switch back to Blue immediately
+```
+
+### Docker Port Mapping for Two Environments
+
+Your Spring Boot application listens on port `9091` inside every container. The key insight is that **different host ports can map to the same container port**:
+
+```bash
+# Blue container: EC2 port 9091 → container port 9091
+docker run -d --name cicd-demo -p 9091:9091 IMAGE
+
+# Green container: EC2 port 9092 → container port 9091
+docker run -d --name cicd-demo-green -p 9092:9091 IMAGE
+```
+
+Result:
+
+```
+EC2
+├── :9091 → cicd-demo (Blue) → Spring Boot :9091
+└── :9092 → cicd-demo-green (Green) → Spring Boot :9091
+```
+
+Both applications internally use port 9091. Docker gives them different "doors" on the EC2 host.
+
+**You do NOT change `server.port` in `application.properties`.** The application always runs on 9091 inside every container. Only the external host mapping changes.
+
+### Step-by-Step Manual Blue-Green Deployment
+
+**Step 1 — Verify Blue is running**
+
+```bash
+docker ps
+curl http://localhost/api/hello          # Through Nginx
+curl http://localhost/actuator/health    # Through Nginx
+```
+
+**Step 2 — Start Green alongside Blue**
+
+```bash
+# Pull the new image (new Git SHA)
+docker pull username/cicd-demo:NEW_SHA
+
+# Start Green on port 9092 — Blue is NOT stopped
+docker run -d \
+  --name cicd-demo-green \
+  -p 9092:9091 \
+  username/cicd-demo:NEW_SHA
+```
+
+**Step 3 — Test Green directly (before exposing to users)**
+
+```bash
+# Health check directly on Green (not through Nginx)
+curl http://localhost:9092/actuator/health
+
+# API smoke test directly on Green
+curl http://localhost:9092/api/hello
+```
+
+At this point, users are still on Blue through Nginx. Green is being tested privately.
+
+**Step 4 — Switch Nginx to Green**
+
+```bash
+sudo nano /etc/nginx/sites-available/default
+# Change: proxy_pass http://127.0.0.1:9091;
+# To:     proxy_pass http://127.0.0.1:9092;
+
+sudo nginx -t        # Always test first
+sudo systemctl reload nginx
+```
+
+**Step 5 — Verify through the full production path**
+
+```bash
+# Now testing: User → Nginx → Green → Spring Boot
+curl http://localhost/api/hello
+curl http://localhost/actuator/health
+```
+
+**Step 6 — Keep Blue available (don't delete yet)**
+
+After switching, Blue is still running. This is intentional — if Green develops a problem in the next few minutes, you can instantly roll back by changing `proxy_pass` back to port 9091.
+
+```
+Current state:
+                    Nginx
+                      │
+                      ▼ (actively serving)
+                 Green :9092
+
+                 Blue :9091
+                   (standby, ready for instant rollback)
+```
+
+### Why Blue-Green Beats Stop-and-Replace
+
+| Approach | Downtime Risk | Rollback Speed | Safety |
+|----------|--------------|---------------|--------|
+| Stop old → Start new | Downtime if new fails | Must rebuild/redeploy | Low |
+| Blue-Green | Near zero | Instant Nginx switch | High |
+
+---
+
+## Automatic Rollback
+
+### The Two-Stage Verification Model
+
+Don't switch Nginx until Green passes all pre-switch checks. Then verify again after switching:
+
+```
+Green :9092
+      │
+      ├── Stage 1: Pre-switch
+      │     ├── /actuator/health → ✅
+      │     └── /api/hello → ✅
+      │
+      ↓ (only if Stage 1 passes)
+      │
+Switch Nginx → Green
+      │
+      └── Stage 2: Post-switch
+            └── http://localhost/api/hello → ✅ or ❌ ROLLBACK
+```
+
+**Why two stages?**
+- Stage 1 tests Green directly (no users affected if it fails)
+- Stage 2 confirms the full production path through Nginx works
+- If Stage 2 fails, users experienced a brief problem, but rollback is immediate
+
+### What Rollback Looks Like in the Script
+
+```bash
+# After switching Nginx to Green...
+
+if curl --fail http://localhost/api/hello; then
+
+    echo "Production verification successful! Green is live."
+
+else
+
+    echo "Production verification FAILED! Rolling back to Blue..."
+
+    # 1. Switch Nginx back to Blue
+    sudo sed -i \
+      's/proxy_pass http:\/\/127.0.0.1:9092;/proxy_pass http:\/\/127.0.0.1:9091;/' \
+      /etc/nginx/sites-available/default
+
+    # 2. Test the rollback config
+    sudo nginx -t
+
+    # 3. Reload Nginx
+    sudo systemctl reload nginx
+
+    # 4. Verify Blue is working
+    if curl --fail http://localhost/api/hello; then
+        echo "Rollback successful. Blue is serving traffic."
+    else
+        echo "CRITICAL: Rollback verification also failed!"
+        exit 1
+    fi
+
+    # 5. Remove the failed Green container
+    docker stop cicd-demo-green || true
+    docker rm cicd-demo-green || true
+
+    # 6. Fail the GitHub Actions job
+    exit 1
+fi
+```
+
+### Critical Order: Always Remove Green AFTER Switching Back
+
+```
+❌ WRONG order:
+Remove Green → Switch Nginx back to Blue
+
+  (Brief window where Nginx points to a non-existent container)
+
+
+✅ CORRECT order:
+Switch Nginx → Blue → Reload Nginx → Blue serving users → Remove Green
+
+  (Users always have a working backend)
+```
+
+### Why `exit 1` After Successful Rollback?
+
+After rollback succeeds, Blue is running fine. But the GitHub Actions job should still be marked as **failed**:
+
+```
+GitHub Actions result: ❌ FAILED
+Message: "Deployment failed. Rollback to Blue successful."
+```
+
+This tells the team: "The release didn't go out. The previous version is still running." Reporting success when the intended deployment failed would be misleading.
+
+---
+
+## Dynamic Blue-Green Deployment
+
+### The Problem with Hard-Coded Environments
+
+The first version of Blue-Green always deploys to Green:
+
+```
+Deployment 1: Blue → Production, Green → New
+Deployment 2: Green → Production, Green → New (WRONG — deploying to active production!)
+```
+
+After the first deployment, Nginx points to Green. The second deployment also targets Green, which is now the production environment. You'd be replacing the production container while it's serving traffic.
+
+### The Solution: Ask Nginx What's Active
+
+Since Nginx configuration is the source of truth for which environment is active, we read it at deployment time:
+
+```bash
+# Grep the active port from Nginx config
+CURRENT_PORT=$(grep -oP 'proxy_pass http://127\.0\.0\.1:\K[0-9]+' \
+  /etc/nginx/sites-available/default)
+
+# Determine which environment is active and which is the target
+if [ "$CURRENT_PORT" = "9091" ]; then
+
+    ACTIVE_ENV="blue"
+    ACTIVE_PORT=9091
+    TARGET_ENV="green"
+    TARGET_PORT=9092
+
+elif [ "$CURRENT_PORT" = "9092" ]; then
+
+    ACTIVE_ENV="green"
+    ACTIVE_PORT=9092
+    TARGET_ENV="blue"
+    TARGET_PORT=9091
+
+else
+    echo "ERROR: Unexpected Nginx port: $CURRENT_PORT"
+    exit 1
+fi
+
+CONTAINER_NAME="cicd-demo-$TARGET_ENV"
+```
+
+### The Alternating Deployment Pattern
+
+```
+Initially:
+  Nginx → 9091 → Blue is production
+  Target = Green
+
+Deployment 1:
+  Nginx → 9092 → Green is production
+  Target = Blue
+
+Deployment 2:
+  Nginx → 9091 → Blue is production
+  Target = Green
+
+Deployment 3:
+  Nginx → 9092 → Green is production
+  Target = Blue
+```
+
+Blue and Green alternate roles automatically with every deployment.
+
+### Critical Bug: Single Quotes in `sed`
+
+The most common mistake when writing the dynamic switch:
+
+```bash
+# ❌ WRONG — single quotes prevent variable expansion
+sudo sed -i \
+  's/proxy_pass http:\/\/127.0.0.1:$ACTIVE_PORT;/proxy_pass http:\/\/127.0.0.1:$TARGET_PORT;/' \
+  /etc/nginx/sites-available/default
+
+# ✅ CORRECT — double quotes allow variable expansion
+sudo sed -i \
+  "s/proxy_pass http:\/\/127\.0\.0\.1:$ACTIVE_PORT;/proxy_pass http:\/\/127.0.0.1:$TARGET_PORT;/" \
+  /etc/nginx/sites-available/default
+```
+
+With single quotes, Bash does not substitute `$ACTIVE_PORT` and `$TARGET_PORT`. The `sed` command searches for a literal string containing `$ACTIVE_PORT`, which doesn't exist in the file, so nothing changes — and you have no idea why the switch didn't work.
+
+---
+
+## The Complete Final Workflow
+
+### Full GitHub Actions YAML
+
+```yaml
+name: cicd-demo
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Make Maven wrapper executable
+        run: chmod +x mvnw
+
+      - name: Test and build
+        run: ./mvnw clean package
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ secrets.DOCKER_USERNAME }}/cicd-demo:${{ github.sha }} \
+            .
+
+      - name: Push Docker image
+        run: |
+          docker push \
+            ${{ secrets.DOCKER_USERNAME }}/cicd-demo:${{ github.sha }}
+
+      - name: Deploy to EC2 (Dynamic Blue-Green)
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            IMAGE=${{ secrets.DOCKER_USERNAME }}/cicd-demo:${{ github.sha }}
+
+            echo "================================"
+            echo "Deploying image: $IMAGE"
+            echo "================================"
+
+            docker pull $IMAGE
+
+            echo "================================"
+            echo "Determining active environment"
+            echo "================================"
+
+            CURRENT_PORT=$(grep -oP 'proxy_pass http://127\.0\.0\.1:\K[0-9]+' \
+              /etc/nginx/sites-available/default)
+
+            if [ "$CURRENT_PORT" = "9091" ]; then
+              ACTIVE_ENV="blue"
+              ACTIVE_PORT=9091
+              TARGET_ENV="green"
+              TARGET_PORT=9092
+            elif [ "$CURRENT_PORT" = "9092" ]; then
+              ACTIVE_ENV="green"
+              ACTIVE_PORT=9092
+              TARGET_ENV="blue"
+              TARGET_PORT=9091
+            else
+              echo "ERROR: Unable to determine active environment."
+              echo "Unexpected Nginx port: $CURRENT_PORT"
+              exit 1
+            fi
+
+            CONTAINER_NAME="cicd-demo-$TARGET_ENV"
+
+            echo "Active: $ACTIVE_ENV (:$ACTIVE_PORT)"
+            echo "Target: $TARGET_ENV (:$TARGET_PORT)"
+            echo "Container: $CONTAINER_NAME"
+
+            echo "================================"
+            echo "Preparing $TARGET_ENV"
+            echo "================================"
+
+            docker stop $CONTAINER_NAME || true
+            docker rm $CONTAINER_NAME || true
+
+            docker run -d \
+              --name $CONTAINER_NAME \
+              -p $TARGET_PORT:9091 \
+              $IMAGE
+
+            echo "================================"
+            echo "Health checking $TARGET_ENV"
+            echo "================================"
+
+            HEALTHY=false
+            for i in {1..30}; do
+              if curl --fail http://localhost:$TARGET_PORT/actuator/health; then
+                HEALTHY=true
+                echo "$TARGET_ENV is healthy!"
+                break
+              fi
+              echo "$TARGET_ENV not ready. Attempt $i/30"
+              sleep 2
+            done
+
+            if [ "$HEALTHY" != "true" ]; then
+              echo "$TARGET_ENV deployment failed!"
+              docker logs $CONTAINER_NAME
+              docker stop $CONTAINER_NAME || true
+              docker rm $CONTAINER_NAME || true
+              exit 1
+            fi
+
+            echo "================================"
+            echo "Smoke testing $TARGET_ENV"
+            echo "================================"
+
+            if curl --fail http://localhost:$TARGET_PORT/api/hello; then
+              echo "$TARGET_ENV API smoke test passed!"
+            else
+              echo "$TARGET_ENV API smoke test FAILED!"
+              docker logs $CONTAINER_NAME
+              docker stop $CONTAINER_NAME || true
+              docker rm $CONTAINER_NAME || true
+              exit 1
+            fi
+
+            echo "================================"
+            echo "Switching Nginx"
+            echo "================================"
+
+            sudo sed -i \
+              "s/proxy_pass http:\/\/127\.0\.0\.1:$ACTIVE_PORT;/proxy_pass http:\/\/127.0.0.1:$TARGET_PORT;/" \
+              /etc/nginx/sites-available/default
+
+            if ! sudo nginx -t; then
+              echo "Nginx configuration failed! Restoring..."
+              sudo sed -i \
+                "s/proxy_pass http:\/\/127\.0\.0\.1:$TARGET_PORT;/proxy_pass http:\/\/127.0.0.1:$ACTIVE_PORT;/" \
+                /etc/nginx/sites-available/default
+              exit 1
+            fi
+
+            sudo systemctl reload nginx
+
+            echo "================================"
+            echo "Verifying production traffic"
+            echo "================================"
+
+            if curl --fail http://localhost/api/hello; then
+              echo "Production verification successful!"
+              echo "$TARGET_ENV is now serving production traffic."
+            else
+              echo "Production verification FAILED! Rolling back to $ACTIVE_ENV..."
+
+              sudo sed -i \
+                "s/proxy_pass http:\/\/127\.0\.0\.1:$TARGET_PORT;/proxy_pass http:\/\/127.0.0.1:$ACTIVE_PORT;/" \
+                /etc/nginx/sites-available/default
+
+              if ! sudo nginx -t; then
+                echo "CRITICAL: Rollback configuration is invalid!"
+                exit 1
+              fi
+
+              sudo systemctl reload nginx
+
+              echo "Verifying $ACTIVE_ENV after rollback..."
+              if curl --fail http://localhost/api/hello; then
+                echo "Rollback successful. $ACTIVE_ENV is serving traffic."
+              else
+                echo "CRITICAL: Rollback verification failed!"
+                exit 1
+              fi
+
+              docker stop $CONTAINER_NAME || true
+              docker rm $CONTAINER_NAME || true
+
+              exit 1
+            fi
+```
+
+### The CI vs CD Trigger
+
+Note this workflow uses only:
+
+```yaml
+on:
+  push:
+    branches:
+      - main
+```
+
+**Not** `pull_request`. This is important:
+
+```
+Feature branch
+      ↓
+Pull Request → CI only (build + test)
+      ↓
+Code review + merge
+      ↓
+main branch
+      ↓
+CD triggered (build + test + deploy)
+```
+
+You don't want every pull request deploying to production.
+
+---
+
+## Common Bugs and Pitfalls
+
+### 1. Single Quotes Block Variable Expansion in `sed`
+
+```bash
+# ❌ Variables not expanded — sed finds nothing to replace
+'s/proxy_pass http:\/\/127.0.0.1:$ACTIVE_PORT;/.../'
+
+# ✅ Variables are expanded before sed runs
+"s/proxy_pass http:\/\/127\.0\.0\.1:$ACTIVE_PORT;/.../"
+```
+
+### 2. Stopping the Active Production Container
+
+```bash
+# ❌ DANGEROUS — this might be your production environment
+docker stop cicd-demo-green || true
+docker rm cicd-demo-green || true
+# (done BEFORE determining which is active)
+
+# ✅ Only stop the TARGET container after determining active env
+CONTAINER_NAME="cicd-demo-$TARGET_ENV"
+docker stop $CONTAINER_NAME || true
+docker rm $CONTAINER_NAME || true
+```
+
+### 3. Removing Green Before Switching Nginx
+
+```bash
+# ❌ Gap where Nginx points to nothing
+docker stop cicd-demo-green
+sudo sed -i ... (switch to blue)
+sudo systemctl reload nginx
+
+# ✅ Switch Nginx first, then remove
+sudo sed -i ... (switch to blue)
+sudo systemctl reload nginx
+docker stop cicd-demo-green
+```
+
+### 4. Not Validating Nginx Before Reload
+
+```bash
+# ❌ Could break production if config has a typo
+sudo systemctl reload nginx
+
+# ✅ Always test first
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+### 5. YAML Indentation in GitHub Actions
+
+GitHub Actions YAML is indentation-sensitive. This is **invalid**:
+
+```yaml
+# ❌ Wrong
+on:
+push:
+branches:
+- main
+jobs:
+build-and-deploy:
+```
+
+This is **correct**:
+
+```yaml
+# ✅ Correct
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+```
+
+Use `actionlint` to validate GitHub Actions YAML files:
+
+```bash
+# Install
+choco install actionlint    # Windows
+brew install actionlint     # Mac
+
+# Run from repository root
+actionlint
+```
+
+### 6. `docker run` Port Order
+
+```bash
+# -p HOST_PORT:CONTAINER_PORT
+# ❌ Easy to get backwards
+docker run -p 9091:9092 IMAGE  # EC2:9091 → Container:9092 (wrong)
+
+# ✅
+docker run -p 9092:9091 IMAGE  # EC2:9092 → Container:9091 (correct for Green)
+```
+
+### 7. Connection Timeout vs Authentication Failure
+
+| Error | Root Cause | Fix |
+|-------|-----------|-----|
+| `dial tcp ...:22: i/o timeout` | Security Group blocking TCP connection | Allow the source IP in Security Group |
+| `Permission denied (publickey)` | SSH connected but key was rejected | Use correct .pem file |
+| `No such container` | Container doesn't exist | Use `|| true` for optional stops |
+| `COPY target/*.jar failed` | JAR not built yet | Run Maven before Docker build |
+
+---
+
+## Interview Q&A — Advanced Topics
+
+### Q1: Why do you use Git commit SHA instead of version numbers for Docker tags?
+
+**Answer:** Version numbers like `:3.0` are applied manually and can be overwritten — if you push a new image with the same tag, you lose the previous one. Using the Git commit SHA (`github.sha`) as the tag means every image is uniquely and automatically identified. The tag directly corresponds to a commit, so you can always answer "what version is running?" by looking at the Docker image tag and finding that commit in Git history. It also makes rollback trivial — instead of figuring out what `:3.0` represented last Tuesday, you know exactly which SHA to redeploy.
+
+---
+
+### Q2: What is a reverse proxy and why do you use Nginx in your pipeline?
+
+**Answer:** A reverse proxy is a server that sits between users and backend servers, receiving requests and forwarding them to the appropriate backend. It acts on behalf of the server infrastructure, hiding internal details from clients. I use Nginx as a reverse proxy in our Blue-Green deployment so that users always access the same URL (`http://EC2-IP`), while Nginx internally routes to either the Blue container on port 9091 or the Green container on 9092. Switching production traffic from one to the other is just a configuration change and an Nginx reload — the user never knows it happened.
+
+---
+
+### Q3: Explain Blue-Green deployment and why it's better than a stop-and-replace approach.
+
+**Answer:** Blue-Green deployment maintains two identical environments: Blue (currently serving production traffic) and Green (where the new version is deployed and tested). While Green is being tested, Blue continues serving users without interruption. Once Green passes health checks and smoke tests, Nginx traffic is switched from Blue to Green — this switch takes milliseconds. If Green is unhealthy, we simply never switch Nginx, so users never see the broken version. In contrast, a stop-and-replace approach stops the old container before confirming the new one works, creating a window of downtime or broken requests. Blue-Green eliminates that window.
+
+---
+
+### Q4: What happens in your pipeline when a deployment fails?
+
+**Answer:** Our pipeline has two failure gates. The first is pre-switch: we deploy Green, run health checks against port 9092 and smoke-test the API. If Green fails, we remove it and exit with a failure code — Nginx was never touched, so Blue continues serving all production traffic with zero user impact. The second gate is post-switch: after switching Nginx to Green, we verify the full production route. If this fails, we run automatic rollback — the `sed` command is reversed, Nginx is reloaded back to Blue, and we verify Blue is healthy before removing Green and failing the pipeline.
+
+---
+
+### Q5: Why must you determine the active environment dynamically instead of hard-coding "always deploy to Green"?
+
+**Answer:** After the first successful deployment, Green becomes the production environment. If we always deploy to Green, the second deployment would replace the container that's actively serving users. By reading the Nginx configuration at deployment time and identifying which port is currently active, we know to target the inactive environment. This makes the deployment safe regardless of which environment is currently live — Blue and Green alternate roles with each deployment.
+
+---
+
+### Q6: What's the difference between `docker ps` and `docker ps -a`?
+
+**Answer:** `docker ps` shows only currently running containers. `docker ps -a` shows all containers, including those that have stopped or crashed (status: "Exited"). This matters in CI/CD because a container can start and then immediately crash — `docker ps` shows nothing, but `docker ps -a` reveals `Exited (1) 10 seconds ago`. Without checking `docker ps -a`, you might think your deployment succeeded when the application actually crashed on startup.
+
+---
+
+### Q7: Why do you use `|| true` in the deployment script?
+
+**Answer:** `||` means "OR" in bash — if the left command fails, execute the right command. `true` always succeeds. So `docker stop cicd-demo-green || true` means: "Try to stop the container. If it doesn't exist and the command fails, that's okay — continue." Without `|| true`, trying to stop a non-existent container on the first deployment would fail the entire pipeline. It makes stop/remove operations idempotent — safe to run whether or not the container exists.
+
+---
+
+### Q8: How do you validate Nginx configuration changes before applying them?
+
+**Answer:** Before every `sudo systemctl reload nginx`, I run `sudo nginx -t`. This tests the configuration syntax without applying it. If the test fails, I restore the previous configuration using `sed` to reverse the change, then exit the deployment as failed. This prevents a situation where a bad Nginx config causes Nginx to fail on reload, taking down the reverse proxy and making the application unreachable. Validating before applying is a critical production habit.
+
+---
+
+## Architecture Evolution Summary
+
+Here's how the pipeline evolved through each learning stage:
+
+### Stage 1 — Basic Deployment (Where We Started)
+
+```
+git push → Maven → Docker → Push → EC2 → docker run
+Problem: No health checks, fixed tag, no rollback
+```
+
+### Stage 2 — SHA Tagging
+
+```
+git push → Maven → Docker → Push (with :SHA) → EC2 → docker run :SHA
+Improvement: Traceability, rollback possible
+Problem: Still no health checks
+```
+
+### Stage 3 — Health Check Retry Loop
+
+```
+... → docker run → retry curl /actuator/health → exit 1 if unhealthy
+Improvement: Catches crashed applications
+Problem: Stops old container before confirming new one works
+```
+
+### Stage 4 — Nginx + Manual Blue-Green
+
+```
+... → Start Green :9092 → Test Green → Switch Nginx → Verify
+Improvement: Zero downtime, instant rollback available
+Problem: Always deploys to Green (unsafe after first deployment)
+```
+
+### Stage 5 — Automatic Rollback
+
+```
+... → Green → Pre-switch tests → Switch Nginx → Post-switch verify → ROLLBACK if fails
+Improvement: Automatic recovery from bad deployments
+```
+
+### Stage 6 — Dynamic Blue-Green (Current)
+
+```
+... → Read Nginx config → Determine active env → Deploy to inactive env → Test → Switch
+Improvement: Pipeline knows which environment is production, never deploys to active env
+```
+
+### What's Next
+
+| Next Step | Description |
+|-----------|-------------|
+| Nginx upstream block | Replace `sed` hacking with a clean upstream configuration file |
+| Separate CI/CD workflows | PR = build + test only; main merge = full deployment |
+| AWS ECR | Private image registry with IAM integration instead of Docker Hub |
+| GitHub OIDC | Temporary AWS credentials instead of long-lived SSH keys |
+| Zero-downtime improvement | Handle in-flight requests during the Nginx reload |
+| Monitoring & alerting | Connect health checks to PagerDuty/Slack alerts |
+
+---
+
+*This document covers the advanced practical CI/CD concepts built on top of the foundational pipeline — from Docker image versioning and health checks through to a production-grade dynamic Blue-Green deployment with automatic rollback.*
+
